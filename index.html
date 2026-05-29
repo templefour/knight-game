@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-    <title>弑君者 · 完整规则（修正版）</title>
+    <title>弑君者 · 完整联机版</title>
     <style>
         * { box-sizing: border-box; user-select: none; }
         body {
@@ -23,20 +23,21 @@
             border-radius: 48px;
             padding: 20px;
         }
-        .lobby {
+        .lobby, .waiting-room {
             background: #2c5a2e;
             border-radius: 32px;
             padding: 30px;
             text-align: center;
         }
-        .lobby input, .lobby button {
+        .waiting-room { display: none; }
+        .lobby input, .lobby button, .waiting-room button {
             font-size: 1.2rem;
             padding: 12px 20px;
             margin: 10px;
             border-radius: 60px;
             border: none;
         }
-        .lobby button {
+        .lobby button, .waiting-room button {
             background: #e6b422;
             cursor: pointer;
             font-weight: bold;
@@ -108,6 +109,7 @@
             box-shadow: 2px 2px 6px rgba(0,0,0,0.3);
             cursor: pointer;
             transition: 0.05s linear;
+            position: relative;
         }
         .card.selected {
             background: #ffecb3;
@@ -116,6 +118,9 @@
         }
         .card-suit { font-size: 1.8rem; }
         .card-rank { font-size: 1.4rem; }
+        /* 花色颜色强制 */
+        .card[data-suit="♥"] .card-suit, .card[data-suit="♦"] .card-suit { color: red; }
+        .card[data-suit="♠"] .card-suit, .card[data-suit="♣"] .card-suit { color: black; }
         .controls {
             background: #00000066;
             border-radius: 30px;
@@ -164,6 +169,13 @@
             overflow: auto;
             color: white;
         }
+        .deck-info {
+            display: flex;
+            justify-content: center;
+            gap: 20px;
+            margin-bottom: 10px;
+            font-size: 0.9rem;
+        }
         @media (max-width: 700px) {
             .card { width: 50px; height: 70px; }
             .card-suit { font-size: 1.4rem; }
@@ -172,8 +184,9 @@
 </head>
 <body>
 <div class="container" id="app">
+    <!-- 大厅 -->
     <div id="lobby" class="lobby">
-        <h1>⚔️ 弑君者 · 完整规则 ⚔️</h1>
+        <h1>⚔️ 弑君者 · 完整联机版 ⚔️</h1>
         <p>合作击败四种花色的 J・Q・K</p>
         <input type="text" id="roomCode" placeholder="房间码 (4位数字)" maxlength="4">
         <input type="text" id="playerName" placeholder="你的名字">
@@ -182,7 +195,22 @@
         <button id="joinRoomBtn">🚪 加入房间</button>
         <div id="lobbyMsg" style="margin-top: 20px;"></div>
     </div>
+
+    <!-- 等待房间界面 -->
+    <div id="waitingRoom" class="waiting-room">
+        <h2>🏠 房间: <span id="waitRoomCode"></span></h2>
+        <div id="playerList"></div>
+        <button id="startGameBtn" style="background: #ffaa33;">▶ 开始游戏</button>
+        <button id="leaveRoomBtn">离开房间</button>
+        <div id="waitMsg"></div>
+    </div>
+
+    <!-- 游戏界面 -->
     <div id="gamePanel" class="game-panel">
+        <div class="deck-info">
+            <span>📚 摸牌堆: <span id="deckCount">0</span> 张</span>
+            <span>🗑️ 弃牌堆: <span id="discardCount">0</span> 张</span>
+        </div>
         <div class="status-bar">
             <span>🏆 击败12个BOSS</span>
             <span>👥 <span id="playerCountDisplay">0</span> 人</span>
@@ -196,9 +224,9 @@
         </div>
         <div class="players-area" id="playersContainer"></div>
         <div class="controls">
-            <button id="endPhaseBtn">⏩ 跳过回合</button>
+            <button id="skipBtn">⏩ 跳过回合 (仍要防御)</button>
             <button id="attackBtn">⚡ 打出选中的牌 ⚡</button>
-            <button id="defendBtn">🛡️ 手动防御 (弃牌)</button>
+            <button id="restartBtn">🔄 重新开始</button>
         </div>
         <div class="log" id="gameLog"></div>
         <div style="font-size:0.7rem; text-align:center;">💡 点击手牌选中(连招/宠物自动组合) → 点【打出】；防御阶段需手动选择弃牌，点数之和≥BOSS攻击力</div>
@@ -210,10 +238,18 @@
     const SUITS = ['♠', '♥', '♣', '♦'];
     const SUIT_NAME = { '♠':'黑桃', '♥':'红桃', '♣':'梅花', '♦':'方块' };
     const BOSS_STATS = { 'J':{atk:10, hp:20}, 'Q':{atk:15, hp:30}, 'K':{atk:20, hp:40} };
+    const RANK_POINT = { 'J':11, 'Q':12, 'K':13, 'A':1 };
     
-    // ---------- 全局游戏状态 ----------
+    // 全局变量
+    let myPlayerId = null;
+    let myName = '';
+    let ws = null;
+    let isMyTurn = false;
+    let isHost = false;      // 房主才有权开始游戏
+    let currentRoomId = null;
+    
+    // 游戏状态 (由房主初始化后同步)
     let gameState = {
-        roomId: null,
         players: [],
         currentPlayerIdx: 0,
         playerDeck: [],
@@ -223,20 +259,17 @@
         gameOver: false,
         winner: false,
         selectedCards: [],
-        log: []
+        log: [],
+        jokerUsedCount: 0,       // 单人模式鬼牌使用次数
+        jokerDisabled: false,    // 是否本回合因鬼牌而跳过攻击
     };
     
-    let myPlayerId = null;
-    let myName = '';
-    let ws = null;
-    let isMyTurn = false;
-    
     // ---------- 辅助函数 ----------
-    function addLog(msg) {
+    function addLog(msg, sync=true) {
         gameState.log.unshift(`[${new Date().toLocaleTimeString()}] ${msg}`);
-        if (gameState.log.length > 40) gameState.log.pop();
+        if (gameState.log.length > 50) gameState.log.pop();
         renderLog();
-        sendGameState();
+        if (sync) sendGameState();
     }
     
     function renderLog() {
@@ -252,23 +285,41 @@
         return arr;
     }
     
-    // 初始化牌库（生成完整扑克牌，移除 J/Q/K 作为BOSS，剩下的为玩家牌库）
-    function initGameData(playerCount) {
-        let allCards = [];
+    // 生成完整扑克牌 (包含鬼牌)
+    function createFullDeck(includeJokers, jokerCount) {
+        let deck = [];
         for (let s of SUITS) {
-            for (let r of [1,2,3,4,5,6,7,8,9,10]) allCards.push({ suit:s, rank:r, point:r });
-            allCards.push({ suit:s, rank:'J', point:11 });
-            allCards.push({ suit:s, rank:'Q', point:12 });
-            allCards.push({ suit:s, rank:'K', point:13 });
-            allCards.push({ suit:s, rank:'A', point:1 });
+            for (let r of [1,2,3,4,5,6,7,8,9,10]) deck.push({ suit:s, rank:r, point:r });
+            deck.push({ suit:s, rank:'J', point:11 });
+            deck.push({ suit:s, rank:'Q', point:12 });
+            deck.push({ suit:s, rank:'K', point:13 });
+            deck.push({ suit:s, rank:'A', point:1 });
         }
+        if (includeJokers) {
+            for (let i=0; i<jokerCount; i++) deck.push({ suit:'🃏', rank:'Joker', point:0, isJoker:true });
+        }
+        return deck;
+    }
+    
+    // 初始化游戏数据 (牌库分配)
+    function initGameData(playersList) {
+        let playerCount = playersList.length;
+        // 确定鬼牌数量
+        let jokerCount = 0;
+        if (playerCount === 1) jokerCount = 2;      // 单人模式可用2张
+        else if (playerCount === 3) jokerCount = 1;
+        else if (playerCount === 4) jokerCount = 2;
+        // 生成全量牌
+        let allCards = createFullDeck(jokerCount>0, jokerCount);
+        // 分离BOSS牌 (J Q K)
         let bossPool = [];
         let playerPool = [];
         for (let c of allCards) {
-            if (c.rank === 'J' || c.rank === 'Q' || c.rank === 'K') bossPool.push(c);
+            if (!c.isJoker && (c.rank === 'J' || c.rank === 'Q' || c.rank === 'K')) bossPool.push(c);
             else playerPool.push(c);
         }
         let playerDeck = shuffle([...playerPool]);
+        // BOSS堆叠: 底层K 中层Q 上层J (各自洗混)
         let ks = bossPool.filter(c => c.rank === 'K');
         let qs = bossPool.filter(c => c.rank === 'Q');
         let js = bossPool.filter(c => c.rank === 'J');
@@ -280,16 +331,23 @@
             hp: BOSS_STATS[firstBoss.rank].hp,
             atk: BOSS_STATS[firstBoss.rank].atk
         };
-        return { playerDeck, bossStack, currentBoss };
+        // 计算手牌上限
+        let handLimit = 9 - playerCount;
+        // 为每个玩家发牌
+        for (let p of playersList) {
+            p.hand = [];
+            drawCards(playerDeck, [], handLimit, p.hand, handLimit);
+        }
+        return { playerDeck, discardPile: [], bossStack, currentBoss, players: playersList };
     }
     
-    // 抽牌（从牌库抽，不够则洗弃牌堆，但受手牌上限限制）
+    // 抽牌 (自动洗弃牌堆)
     function drawCards(deck, discard, count, hand, handLimit) {
         let drawn = [];
         for (let i = 0; i < count; i++) {
             if (deck.length === 0) {
                 if (discard.length === 0) break;
-                addLog("牌库已空，洗入弃牌堆");
+                addLog("摸牌堆已空，洗入弃牌堆", false);
                 deck.push(...shuffle([...discard]));
                 discard.length = 0;
             }
@@ -303,21 +361,11 @@
     }
     
     function handLimit() {
-        let cnt = gameState.players.length;
-        return 9 - cnt;
+        return 9 - gameState.players.length;
     }
     
-    function clearSelected() {
-        gameState.selectedCards = [];
-        renderGame();
-    }
-    
-    // 计算手牌总点数
     function totalHandPoint(hand) {
-        return hand.reduce((sum, c) => {
-            let pt = (typeof c.rank === 'number') ? c.rank : (c.rank === 'A' ? 1 : (c.rank === 'J' ? 11 : (c.rank === 'Q' ? 12 : 13)));
-            return sum + pt;
-        }, 0);
+        return hand.reduce((sum, c) => sum + (c.isJoker ? 0 : (typeof c.rank === 'number' ? c.rank : (RANK_POINT[c.rank] || 0))), 0);
     }
     
     // 打出牌的核心逻辑
@@ -331,12 +379,26 @@
             return;
         }
         let selectedCards = selectedIndices.map(i => player.hand[i]);
-        // 连招/宠物合法性检查
+        // 检查是否有鬼牌发动
+        let jokerIndex = selectedCards.findIndex(c => c.isJoker);
+        if (jokerIndex !== -1) {
+            // 发动鬼牌效果: 跳过本回合攻击，BOSS免疫无效化，直接进入防御
+            addLog(`🃏 发动鬼牌！当前BOSS免疫失效，跳过攻击阶段。`);
+            gameState.jokerDisabled = true;
+            // 移除鬼牌并放入弃牌堆
+            player.hand.splice(selectedIndices[jokerIndex], 1);
+            gameState.discardPile.push(selectedCards[jokerIndex]);
+            clearSelected();
+            await startDefensePhase(true);
+            return;
+        }
+        
+        // 连招/宠物检查
         let totalPoint = 0;
         let suitsSet = new Set();
         let hasA = false;
         for (let c of selectedCards) {
-            let pt = (typeof c.rank === 'number') ? c.rank : (c.rank === 'A' ? 1 : (c.rank === 'J' ? 11 : (c.rank === 'Q' ? 12 : 13)));
+            let pt = c.isJoker ? 0 : (typeof c.rank === 'number' ? c.rank : (RANK_POINT[c.rank] || 0));
             totalPoint += pt;
             suitsSet.add(c.suit);
             if (c.rank === 'A') hasA = true;
@@ -355,31 +417,19 @@
         }
         clearSelected();
         
-        // ----- 技能处理 -----
+        // 技能处理
         let doubleDamage = false;
         let reduceAtk = 0;
         let healCount = 0;
         let diamondCount = 0;
         let immuneSuit = gameState.currentBoss.suit;
         for (let c of selectedCards) {
-            if (c.suit === immuneSuit) continue;
+            if (c.suit === immuneSuit) continue;   // BOSS免疫花色技能无效
             switch (c.suit) {
                 case '♣': doubleDamage = true; break;
-                case '♠': {
-                    let pt = (c.rank === 'A' ? 1 : (typeof c.rank === 'number' ? c.rank : {J:11,Q:12,K:13}[c.rank]));
-                    reduceAtk += pt;
-                    break;
-                }
-                case '♥': {
-                    let pt = (c.rank === 'A' ? 1 : (typeof c.rank === 'number' ? c.rank : {J:11,Q:12,K:13}[c.rank]));
-                    healCount += pt;
-                    break;
-                }
-                case '♦': {
-                    let pt = (c.rank === 'A' ? 1 : (typeof c.rank === 'number' ? c.rank : {J:11,Q:12,K:13}[c.rank]));
-                    diamondCount += pt;
-                    break;
-                }
+                case '♠': reduceAtk += (c.rank === 'A' ? 1 : (typeof c.rank === 'number' ? c.rank : RANK_POINT[c.rank])); break;
+                case '♥': healCount += (c.rank === 'A' ? 1 : (typeof c.rank === 'number' ? c.rank : RANK_POINT[c.rank])); break;
+                case '♦': diamondCount += (c.rank === 'A' ? 1 : (typeof c.rank === 'number' ? c.rank : RANK_POINT[c.rank])); break;
             }
         }
         
@@ -389,23 +439,23 @@
             addLog(`🖤 黑桃减少BOSS ${reduceAtk} 攻击，现攻击力 ${gameState.currentBoss.atk}`);
         }
         
-        // 红桃：从弃牌堆随机返还 healCount 张牌到当前玩家的牌库底
+        // 红桃：从弃牌堆随机返还牌到牌库底
         if (healCount > 0 && gameState.discardPile.length > 0) {
             let returnCount = Math.min(healCount, gameState.discardPile.length);
             let indices = shuffle([...Array(gameState.discardPile.length).keys()]).slice(0, returnCount);
             let returned = indices.map(i => gameState.discardPile[i]);
             for (let i of indices.sort((a,b)=>b-a)) gameState.discardPile.splice(i,1);
             gameState.playerDeck.unshift(...returned);
-            addLog(`♥ 红桃返还 ${returned.length} 张牌到牌库底`);
+            addLog(`♥ 红桃返还 ${returned.length} 张牌到牌库底: ${returned.map(c=>c.suit+c.rank).join(',')}`);
         }
         
-        // 方块：全体轮流抽卡
+        // 方块：全体轮流抽牌
         if (diamondCount > 0) {
             addLog(`♦ 方块效果：全体轮流抽 ${diamondCount} 张牌`);
             await performDiamondDraw(diamondCount);
         }
         
-        // ----- 伤害计算 -----
+        // 伤害计算
         let damage = totalPoint;
         if (doubleDamage) damage *= 2;
         addLog(`⚔️ 造成 ${damage} 点伤害 (原始 ${totalPoint}${doubleDamage ? ' x2' : ''})`);
@@ -413,16 +463,22 @@
         let newHp = boss.hp - damage;
         if (newHp <= 0) {
             if (newHp === 0) {
-                addLog(`✨ 感化 BOSS！${boss.suit}${boss.rank} 加入牌库顶`);
-                let bossCard = { suit: boss.suit, rank: boss.rank, point: (boss.rank==='J'?11:boss.rank==='Q'?12:13) };
+                // 感化：BOSS牌放入摸牌堆顶
+                let bossCard = { suit: boss.suit, rank: boss.rank, point: RANK_POINT[boss.rank] };
                 gameState.playerDeck.unshift(bossCard);
+                addLog(`✨ 感化 BOSS！${boss.suit}${boss.rank} 加入摸牌堆顶 (点数 ${bossCard.point})`);
             } else {
                 addLog(`💀 BOSS 死亡！`);
             }
-            // 击杀或感化后，处理下一个BOSS
+            // 处理下一个BOSS
             if (gameState.bossStack.length === 0) {
                 addLog("🏆 胜利！所有BOSS已被击败！🏆");
                 gameState.gameOver = true;
+                gameState.winner = true;
+                if (gameState.players.length === 1 && gameState.jokerUsedCount !== undefined) {
+                    let medal = gameState.jokerUsedCount === 0 ? "🥇 金牌胜利" : (gameState.jokerUsedCount === 1 ? "🥈 银牌胜利" : "🥉 铜牌胜利");
+                    addLog(medal);
+                }
                 renderGame();
                 sendGameState();
                 return;
@@ -437,7 +493,7 @@
                 addLog(`👹 新BOSS出现: ${next.suit}${next.rank} | 生命 ${gameState.currentBoss.hp} 攻击 ${gameState.currentBoss.atk}`);
                 renderGame();
                 sendGameState();
-                // 击杀后不进行防御，直接结束回合
+                // 感化/击杀后直接结束回合
                 endTurn();
                 return;
             }
@@ -447,13 +503,13 @@
             renderGame();
             sendGameState();
             // 进入防御阶段
-            await startDefensePhase();
+            await startDefensePhase(false);
         }
         renderGame();
         sendGameState();
     }
     
-    // 方块技能：全体轮流抽卡，抽满 diamondCount 张为止，有人手满则跳过
+    // 方块抽牌实现
     async function performDiamondDraw(totalCount) {
         let remaining = totalCount;
         let playerCount = gameState.players.length;
@@ -465,7 +521,7 @@
             if (player.hand.length < limit) {
                 let drawn = drawCards(gameState.playerDeck, gameState.discardPile, 1, player.hand, limit);
                 if (drawn.length === 0) break;
-                addLog(`${player.name} 抽到 1 张牌`);
+                addLog(`${player.name} 抽到 ${drawn[0].suit}${drawn[0].rank}`);
                 remaining--;
             } else {
                 addLog(`${player.name} 手牌已满，跳过`);
@@ -477,8 +533,8 @@
         sendGameState();
     }
     
-    // 防御阶段：先检查手牌总点数，不足则失败；否则弹出模态框让玩家选择弃牌
-    async function startDefensePhase() {
+    // 防御阶段 (skipAttack: 是否因跳过回合或鬼牌而强制进入防御)
+    async function startDefensePhase(skipAttack = false) {
         if (!isMyTurn || gameState.gameOver) return;
         let player = gameState.players.find(p => p.id === myPlayerId);
         let needAtk = gameState.currentBoss.atk;
@@ -496,24 +552,27 @@
             addLog("未选择弃牌，自动选择最小组合");
             selectedDefense = autoSelectDefense(player.hand, needAtk);
         }
-        // 弃掉选中的牌
+        // 记录弃牌详情
+        let discardedCards = selectedDefense.map(idx => player.hand[idx]);
+        addLog(`🛡️ 防御弃牌: ${discardedCards.map(c=>c.suit+c.rank).join(', ')} (共${discardedCards.reduce((s,c)=>s+(c.isJoker?0:(typeof c.rank==='number'?c.rank:RANK_POINT[c.rank])),0)}点)`);
+        // 弃牌
         for (let idx of selectedDefense.sort((a,b)=>b-a)) {
-            player.hand.splice(idx, 1);
+            let removed = player.hand.splice(idx, 1)[0];
+            gameState.discardPile.push(removed);
         }
-        addLog(`🛡️ 防御成功，弃置 ${selectedDefense.length} 张牌，总点数满足要求`);
-        // 防御结束，回合结束
+        // 结束回合
         endTurn();
         renderGame();
         sendGameState();
     }
     
-    // 自动选择弃牌（贪心：选点数大的牌，尽快达到要求）
     function autoSelectDefense(hand, need) {
-        let cardsWithIdx = hand.map((c, idx) => ({ idx, point: (typeof c.rank === 'number') ? c.rank : (c.rank === 'A' ? 1 : (c.rank === 'J' ? 11 : (c.rank === 'Q' ? 12 : 13))) }));
+        let cardsWithIdx = hand.map((c, idx) => ({ idx, point: c.isJoker ? 0 : (typeof c.rank === 'number' ? c.rank : (RANK_POINT[c.rank] || 0)) }));
         cardsWithIdx.sort((a,b) => b.point - a.point);
         let sum = 0;
         let selected = [];
         for (let c of cardsWithIdx) {
+            if (c.point === 0) continue;
             selected.push(c.idx);
             sum += c.point;
             if (sum >= need) break;
@@ -521,7 +580,6 @@
         return selected;
     }
     
-    // 模态框：让玩家选择要弃置的牌
     function showDefenseModal(hand, need) {
         return new Promise((resolve) => {
             let modalDiv = document.createElement('div');
@@ -532,7 +590,8 @@
             let cardsDiv = content.querySelector('#defenseCards');
             let checkboxes = [];
             hand.forEach((card, idx) => {
-                let pt = (typeof card.rank === 'number') ? card.rank : (card.rank === 'A' ? 1 : (card.rank === 'J' ? 11 : (card.rank === 'Q' ? 12 : 13)));
+                if (card.isJoker) return;
+                let pt = typeof card.rank === 'number' ? card.rank : (RANK_POINT[card.rank] || 0);
                 let label = document.createElement('label');
                 label.style.display = 'flex';
                 label.style.alignItems = 'center';
@@ -559,7 +618,7 @@
                 let selected = [];
                 checkboxes.forEach(cb => { if (cb.checked) selected.push(parseInt(cb.value)); });
                 let sum = selected.reduce((s, idx) => {
-                    let pt = (typeof hand[idx].rank === 'number') ? hand[idx].rank : (hand[idx].rank === 'A' ? 1 : (hand[idx].rank === 'J' ? 11 : (hand[idx].rank === 'Q' ? 12 : 13)));
+                    let pt = hand[idx].isJoker ? 0 : (typeof hand[idx].rank === 'number' ? hand[idx].rank : (RANK_POINT[hand[idx].rank] || 0));
                     return s + pt;
                 }, 0);
                 if (sum < need) {
@@ -576,23 +635,21 @@
         });
     }
     
-    // 结束回合，轮到下一位（不抽牌）
     function endTurn() {
         if (gameState.gameOver) return;
         let nextIdx = (gameState.currentPlayerIdx + 1) % gameState.players.length;
         gameState.currentPlayerIdx = nextIdx;
-        let nextPlayer = gameState.players[nextIdx];
+        gameState.jokerDisabled = false; // 重置鬼牌标记
         clearSelected();
-        addLog(`轮到 ${nextPlayer.name}`);
+        addLog(`轮到 ${gameState.players[nextIdx].name}`);
         renderGame();
         sendGameState();
     }
     
-    // 跳过回合（直接结束回合）
     function skipTurn() {
         if (!isMyTurn || gameState.gameOver) return;
-        addLog(`${gameState.players.find(p=>p.id===myPlayerId).name} 跳过了回合`);
-        endTurn();
+        addLog(`${gameState.players.find(p=>p.id===myPlayerId).name} 跳过了攻击，直接进入防御阶段`);
+        startDefensePhase(true);
     }
     
     function toggleSelectCard(idx) {
@@ -604,6 +661,11 @@
         renderGame();
     }
     
+    function clearSelected() {
+        gameState.selectedCards = [];
+        renderGame();
+    }
+    
     function renderGame() {
         if (!gameState.currentBoss) return;
         document.getElementById('bossDisplay').innerHTML = `${gameState.currentBoss.suit}${gameState.currentBoss.rank}`;
@@ -611,6 +673,8 @@
         document.getElementById('bossAtk').innerText = gameState.currentBoss.atk;
         document.getElementById('immuneSuit').innerText = SUIT_NAME[gameState.currentBoss.suit] || gameState.currentBoss.suit;
         document.getElementById('playerCountDisplay').innerText = gameState.players.length;
+        document.getElementById('deckCount').innerText = gameState.playerDeck.length;
+        document.getElementById('discardCount').innerText = gameState.discardPile.length;
         let myTurnFlag = (gameState.players[gameState.currentPlayerIdx]?.id === myPlayerId);
         isMyTurn = myTurnFlag && !gameState.gameOver;
         document.getElementById('myTurnDisplay').innerHTML = isMyTurn ? "✅ 是" : "⏳ 等待";
@@ -628,6 +692,7 @@
                 p.hand.forEach((card, ci) => {
                     let cardEl = document.createElement('div');
                     cardEl.className = `card ${gameState.selectedCards.includes(ci) ? 'selected' : ''}`;
+                    cardEl.setAttribute('data-suit', card.suit);
                     cardEl.innerHTML = `<div class="card-suit">${card.suit}</div><div class="card-rank">${card.rank}</div>`;
                     cardEl.onclick = () => toggleSelectCard(ci);
                     handDiv.appendChild(cardEl);
@@ -644,70 +709,126 @@
             container.appendChild(div);
         }
         document.getElementById('attackBtn').disabled = !isMyTurn || gameState.gameOver;
-        document.getElementById('endPhaseBtn').disabled = !isMyTurn || gameState.gameOver;
-        document.getElementById('defendBtn').disabled = !isMyTurn || gameState.gameOver;
+        document.getElementById('skipBtn').disabled = !isMyTurn || gameState.gameOver;
     }
     
-    // WebSocket 同步
-    function sendGameState() {
-        if (ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'gameState', roomId: gameState.roomId, state: gameState }));
-        }
+    // 重新开始
+    function restartGame() {
+        if (ws) ws.close();
+        document.getElementById('lobby').style.display = 'block';
+        document.getElementById('waitingRoom').style.display = 'none';
+        document.getElementById('gamePanel').style.display = 'none';
+        gameState = {};
+        myPlayerId = null;
+        isHost = false;
     }
     
-    function onSync(state) {
-        let oldId = myPlayerId;
-        gameState = state;
-        myPlayerId = oldId;
-        renderGame();
-    }
+    // ---------- 联机逻辑 ----------
+    const WS_URL = "wss://你的worker域名/ws";  // 替换为真实地址
     
-    function connectWebSocket(roomId, playerId) {
-        const WS_URL = "knight-websocket.453767897.workers.dev"; // ⚠️ 替换为真实 Worker 地址
+    function connectWebSocket(roomId, playerId, isCreator) {
         ws = new WebSocket(WS_URL);
         ws.onopen = () => {
-            ws.send(JSON.stringify({ type: 'join', roomId, playerId, name: myName }));
+            ws.send(JSON.stringify({ type: 'join', roomId, playerId, name: myName, isCreator }));
         };
         ws.onmessage = (e) => {
             let data = JSON.parse(e.data);
-            if (data.type === 'sync') onSync(data.state);
-            else if (data.type === 'action') {
-                addLog(`其他玩家执行了行动`);
+            if (data.type === 'roomUpdate') {
+                // 房主收到玩家列表更新
+                if (isHost) {
+                    document.getElementById('playerList').innerHTML = data.players.map(p => `<div>${p.name}</div>`).join('');
+                }
+            } else if (data.type === 'gameStart') {
+                // 所有玩家收到初始游戏状态
+                gameState = data.gameState;
+                myPlayerId = playerId;
+                document.getElementById('lobby').style.display = 'none';
+                document.getElementById('waitingRoom').style.display = 'none';
+                document.getElementById('gamePanel').style.display = 'block';
+                renderGame();
+                addLog("游戏开始！");
+            } else if (data.type === 'sync') {
+                gameState = data.state;
+                renderGame();
+            } else if (data.type === 'error') {
+                alert(data.msg);
             }
         };
         ws.onclose = () => addLog("连接断开");
     }
     
-    function startNewGame(roomId, playersList, isCreator) {
-        let { playerDeck, bossStack, currentBoss } = initGameData(playersList.length);
-        let limit = handLimit();
-        for (let p of playersList) {
-            p.hand = [];
-            drawCards(playerDeck, [], limit, p.hand, limit);
-        }
-        gameState = {
-            roomId, players: playersList, currentPlayerIdx: 0,
-            playerDeck, discardPile: [], bossStack, currentBoss,
-            gameOver: false, winner: false, selectedCards: [], log: []
+    // 房主开始游戏
+    function startGameForRoom() {
+        if (!isHost) return;
+        // 初始化游戏数据（包含当前所有玩家）
+        let playersList = [...window.roomPlayers]; // 需要在加入时维护
+        let init = initGameData(playersList);
+        let fullState = {
+            players: init.players,
+            currentPlayerIdx: 0,
+            playerDeck: init.playerDeck,
+            discardPile: init.discardPile,
+            bossStack: init.bossStack,
+            currentBoss: init.currentBoss,
+            gameOver: false,
+            winner: false,
+            selectedCards: [],
+            log: [],
+            jokerUsedCount: 0,
+            jokerDisabled: false,
         };
-        renderGame();
+        // 广播给所有玩家
+        ws.send(JSON.stringify({ type: 'startGame', roomId: currentRoomId, gameState: fullState }));
+        // 本地也设置
+        gameState = fullState;
+        myPlayerId = window.myPlayerId;
         document.getElementById('lobby').style.display = 'none';
+        document.getElementById('waitingRoom').style.display = 'none';
         document.getElementById('gamePanel').style.display = 'block';
-        connectWebSocket(roomId, myPlayerId);
-        addLog(`游戏开始！第一个BOSS: ${currentBoss.suit}${currentBoss.rank}`);
+        renderGame();
     }
     
-    // 事件绑定
+    // 创建房间
     document.getElementById('createRoomBtn').onclick = () => {
         let code = document.getElementById('roomCode').value.trim();
         if (!code) code = Math.floor(1000 + Math.random() * 9000).toString();
         myName = document.getElementById('playerName').value.trim() || "勇士";
         myPlayerId = 'p_' + Date.now() + '_' + Math.random();
-        startNewGame(code, [{ id: myPlayerId, name: myName, hand: [] }], true);
+        currentRoomId = code;
+        isHost = true;
+        window.roomPlayers = [{ id: myPlayerId, name: myName, hand: [] }];
+        connectWebSocket(code, myPlayerId, true);
+        // 显示等待房间
+        document.getElementById('lobby').style.display = 'none';
+        document.getElementById('waitingRoom').style.display = 'block';
+        document.getElementById('waitRoomCode').innerText = code;
+        document.getElementById('playerList').innerHTML = `<div>${myName} (房主)</div>`;
+        document.getElementById('startGameBtn').onclick = startGameForRoom;
+        document.getElementById('leaveRoomBtn').onclick = () => { ws.close(); restartGame(); };
     };
+    
+    // 加入房间
+    document.getElementById('joinRoomBtn').onclick = () => {
+        let code = document.getElementById('roomCode').value.trim();
+        if (!code) { alert("请输入房间码"); return; }
+        myName = document.getElementById('playerName').value.trim() || "勇士";
+        myPlayerId = 'p_' + Date.now() + '_' + Math.random();
+        currentRoomId = code;
+        isHost = false;
+        connectWebSocket(code, myPlayerId, false);
+        // 显示等待界面（等待房主开始）
+        document.getElementById('lobby').style.display = 'none';
+        document.getElementById('waitingRoom').style.display = 'block';
+        document.getElementById('waitRoomCode').innerText = code;
+        document.getElementById('playerList').innerHTML = `<div>等待房主开始游戏...</div>`;
+        document.getElementById('startGameBtn').style.display = 'none';
+        document.getElementById('leaveRoomBtn').onclick = () => { ws.close(); restartGame(); };
+    };
+    
+    // 游戏内重新开始按钮
+    document.getElementById('restartBtn').onclick = () => { restartGame(); };
     document.getElementById('attackBtn').onclick = performAttack;
-    document.getElementById('endPhaseBtn').onclick = skipTurn;
-    document.getElementById('defendBtn').onclick = () => { if (isMyTurn) startDefensePhase(); };
+    document.getElementById('skipBtn').onclick = skipTurn;
 </script>
 </body>
 </html>
